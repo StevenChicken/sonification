@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html>
+<head>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:transparent;overflow:hidden}
+#wrapper{outline:none}
+#info-bar{display:flex;justify-content:space-between;align-items:center;padding:8px 14px;background:#f0f2f6;border-radius:6px;margin-bottom:8px;font-size:13px;min-height:34px;user-select:none}
+#note-label{font-weight:600;color:#333}
+.hint{color:#999;font-size:11px}
+#vf-container{background:#fff;border-radius:8px;overflow-x:auto;cursor:pointer;min-height:80px}
+#focus-hint{text-align:center;font-size:11px;color:#bbb;margin-top:4px;transition:opacity .3s}
+</style>
+</head>
+<body>
+<div id="wrapper" tabindex="0">
+  <div id="info-bar">
+    <span id="note-label">Caricamento...</span>
+    <span class="hint">&larr; &rarr; Seleziona &nbsp;|&nbsp; &uarr; &darr; Durata &nbsp;|&nbsp; Click per selezionare</span>
+  </div>
+  <div id="vf-container"></div>
+  <div id="focus-hint">Clicca qui, poi usa i tasti freccia</div>
+</div>
+
+<script>
+(function(){
+  /* ── Constants ── */
+  var DURATION_STEPS  = [0.25, 0.5, 1.0, 2.0, 4.0];
+  var DURATION_LABELS = ['16esimo','8vo','Quarto','Met\u00e0','Intero'];
+  var DURATION_TO_VF  = {'0.25':'16','0.5':'8','1':'q','2':'h','4':'w'};
+  var BEATS_PER_LINE  = 8;
+  var VF_NOTE = [
+    ['c',null],['c','#'],['d',null],['e','b'],
+    ['e',null],['f',null],['f','#'],['g',null],
+    ['a','b'], ['a',null],['b','b'],['b',null]
+  ];
+  var NAMES = ['Do','Do#','Re','Mib','Mi','Fa','Fa#','Sol','Lab','La','Sib','Si'];
+
+  /* ── State ── */
+  var notes=[], durations=[], selectedIdx=0, chordAtBeat={};
+  var lastNotesJSON=null, lastResetVer=-1;
+  var noteHitBoxes=[];
+  var lineYs=[];
+  var vexReady=false;
+  var pending=null;
+
+  /* ── Streamlit protocol ── */
+  function sendValue(){
+    window.parent.postMessage({
+      type:'streamlit:setComponentValue',
+      value:{selected_idx:selectedIdx, durations:durations.slice()}
+    },'*');
+  }
+  function setHeight(h){
+    window.parent.postMessage({type:'streamlit:setFrameHeight',height:h},'*');
+  }
+  function signalReady(){
+    window.parent.postMessage({type:'streamlit:componentReady',apiVersion:1},'*');
+  }
+
+  /* ── Signal ready IMMEDIATELY (before VexFlow loads) ── */
+  setHeight(200);
+  signalReady();
+
+  /* ── Helpers ── */
+  function vfKey(midi){
+    var pc=midi%12, oct=Math.floor(midi/12)-1;
+    return {letter:VF_NOTE[pc][0], octave:oct, acc:VF_NOTE[pc][1]};
+  }
+  function noteName(midi){return NAMES[midi%12]+(Math.floor(midi/12)-1);}
+  function durLabel(d){
+    var i=DURATION_STEPS.indexOf(d);
+    return i>=0?DURATION_LABELS[i]:'?';
+  }
+  function beatTimes(durs){
+    var t=0,out=[];
+    for(var i=0;i<durs.length;i++){out.push(t);t+=durs[i];}
+    return out;
+  }
+  function durVF(d){return DURATION_TO_VF[String(d)]||'8';}
+
+  /* ── Info bar ── */
+  function updateInfo(){
+    var el=document.getElementById('note-label');
+    if(!notes.length){el.textContent='Nessuna nota';return;}
+    el.textContent='Nota '+selectedIdx+' \u2014 '+noteName(notes[selectedIdx])+' ('+durLabel(durations[selectedIdx])+')';
+  }
+
+  /* ── Render VexFlow ── */
+  function render(){
+    if(!vexReady)return;
+    var c=document.getElementById('vf-container');
+    c.innerHTML='';
+    noteHitBoxes=[];
+    lineYs=[];
+    if(!notes.length){setHeight(120);return;}
+
+    var VF=Vex.Flow;
+    var beats=beatTimes(durations);
+
+    var lines=[],cur=[],lb=0;
+    for(var i=0;i<notes.length;i++){
+      if(lb>=BEATS_PER_LINE&&cur.length){lines.push(cur);cur=[];lb=0;}
+      cur.push(i);
+      lb+=durations[i];
+    }
+    if(cur.length)lines.push(cur);
+
+    var LH=150, W=Math.min(c.clientWidth||860,900);
+    if(W<300)W=860;
+    var totalH=lines.length*LH+30;
+
+    var renderer=new VF.Renderer(c,VF.Renderer.Backends.SVG);
+    renderer.resize(W,totalH);
+    var ctx=renderer.getContext();
+    ctx.setFont('Arial',10,'');
+
+    for(var li=0;li<lines.length;li++){
+      var ids=lines[li];
+      var sy=li*LH+10;
+      var stave=new VF.Stave(10,sy,W-30);
+      if(li===0)stave.addClef('treble');
+      stave.setContext(ctx).draw();
+      lineYs.push(sy+LH/2);
+
+      var vfNotes=[];
+      for(var ni=0;ni<ids.length;ni++){
+        var gi=ids[ni];
+        var k=vfKey(notes[gi]);
+        var bt=beats[gi];
+        var chName=chordAtBeat[bt.toFixed(4)]||null;
+        var sn=new VF.StaveNote({clef:'treble',keys:[k.letter+'/'+k.octave],duration:durVF(durations[gi])});
+        if(k.acc)sn.addAccidental(0,new VF.Accidental(k.acc));
+        if(gi===selectedIdx)sn.setStyle({fillStyle:'#DAA520',strokeStyle:'#DAA520'});
+        if(chName){
+          sn.addModifier(0,
+            new VF.Annotation(chName)
+              .setVerticalJustification(VF.Annotation.VerticalJustify.TOP)
+              .setFont('Arial',11,'bold')
+          );
+        }
+        sn._gi=gi;
+        vfNotes.push(sn);
+      }
+
+      var voice=new VF.Voice({num_beats:4,beat_value:4});
+      voice.setMode(VF.Voice.Mode.SOFT);
+      voice.addTickables(vfNotes);
+      new VF.Formatter().joinVoices([voice]).format([voice],W-60);
+      voice.draw(ctx,stave);
+
+      for(var ni=0;ni<vfNotes.length;ni++){
+        noteHitBoxes.push({lineIdx:li,absX:vfNotes[ni].getAbsoluteX(),globalIdx:vfNotes[ni]._gi});
+      }
+      try{
+        var beams=VF.Beam.generateBeams(vfNotes,{groups:[new VF.Fraction(2,8)]});
+        beams.forEach(function(b){b.setContext(ctx).draw();});
+      }catch(e){}
+    }
+    updateInfo();
+    setHeight(totalH+70);
+  }
+
+  /* ── Click ── */
+  document.getElementById('vf-container').addEventListener('click',function(e){
+    if(!noteHitBoxes.length)return;
+    var r=this.getBoundingClientRect();
+    var cx=e.clientX-r.left+this.scrollLeft, cy=e.clientY-r.top;
+    var cl=0,md=1e9;
+    for(var i=0;i<lineYs.length;i++){var d=Math.abs(cy-lineYs[i]);if(d<md){md=d;cl=i;}}
+    var bi=selectedIdx,bd=1e9;
+    for(var i=0;i<noteHitBoxes.length;i++){
+      if(noteHitBoxes[i].lineIdx!==cl)continue;
+      var dx=Math.abs(cx-noteHitBoxes[i].absX);
+      if(dx<bd){bd=dx;bi=noteHitBoxes[i].globalIdx;}
+    }
+    if(bi!==selectedIdx){selectedIdx=bi;render();sendValue();}
+    document.getElementById('wrapper').focus();
+  });
+
+  /* ── Keyboard ── */
+  document.addEventListener('keydown',function(e){
+    if(!notes.length)return;
+    var handled=false;
+    if(e.key==='ArrowLeft'&&selectedIdx>0){selectedIdx--;handled=true;}
+    else if(e.key==='ArrowRight'&&selectedIdx<notes.length-1){selectedIdx++;handled=true;}
+    else if(e.key==='ArrowUp'){
+      var ci=DURATION_STEPS.indexOf(durations[selectedIdx]);
+      if(ci>=0&&ci<DURATION_STEPS.length-1){durations[selectedIdx]=DURATION_STEPS[ci+1];handled=true;}
+    }
+    else if(e.key==='ArrowDown'){
+      var ci=DURATION_STEPS.indexOf(durations[selectedIdx]);
+      if(ci>0){durations[selectedIdx]=DURATION_STEPS[ci-1];handled=true;}
+    }
+    if(handled){e.preventDefault();render();sendValue();}
+  });
+
+  /* ── Focus ── */
+  var wrapper=document.getElementById('wrapper');
+  var focusHint=document.getElementById('focus-hint');
+  wrapper.addEventListener('focus',function(){focusHint.style.opacity='0';});
+  wrapper.addEventListener('blur',function(){focusHint.style.opacity='1';});
+  wrapper.addEventListener('click',function(){wrapper.focus();});
+
+  /* ── Render handler ── */
+  function onRender(args){
+    var nj=JSON.stringify(args.notes||[]);
+    var rv=args.reset_version||0;
+    if(nj!==lastNotesJSON||rv!==lastResetVer){
+      notes=(args.notes||[]).slice();
+      durations=(args.durations||[]).slice();
+      selectedIdx=args.selected_idx||0;
+      lastNotesJSON=nj;
+      lastResetVer=rv;
+      sendValue();
+    }
+    chordAtBeat={};
+    if(args.chord_data){
+      for(var i=0;i<args.chord_data.length;i++){
+        var cd=args.chord_data[i];
+        chordAtBeat[cd.beat.toFixed(4)]=cd.name;
+      }
+    }
+    if(selectedIdx>=notes.length)selectedIdx=Math.max(0,notes.length-1);
+    render();
+  }
+
+  /* ── Message listener ── */
+  window.addEventListener('message',function(ev){
+    if(ev.data.type==='streamlit:render'){
+      if(vexReady) onRender(ev.data.args);
+      else pending=ev.data.args;
+    }
+  });
+
+  /* ── Load VexFlow asynchronously ── */
+  var script=document.createElement('script');
+  script.src='https://cdn.jsdelivr.net/npm/vexflow@3.0.9/releases/vexflow-min.js';
+  script.onload=function(){
+    vexReady=true;
+    if(pending){onRender(pending);pending=null;}
+  };
+  script.onerror=function(){
+    document.getElementById('note-label').textContent='Errore: impossibile caricare VexFlow';
+  };
+  document.head.appendChild(script);
+})();
+</script>
+</body>
+</html>
